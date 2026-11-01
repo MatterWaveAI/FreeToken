@@ -84,11 +84,11 @@ def _gate(sd, name, mode):
 @torch.no_grad()
 def logits(sd: dict[str, torch.Tensor], cfg: dict, ids: list[int]) -> torch.Tensor:
     """``[len(ids), vocab]`` logits of one sequence, from the HF-named state dict and config.json."""
-    d, heads = cfg["d_model"], cfg["n_heads"]
+    d, heads = cfg["hidden_size"], cfg["num_attention_heads"]
     head_dim = d // heads
     mode = cfg.get("residual_gate_mode", "bounded_depth")
-    d_ff = cfg.get("d_ff") or cfg.get("ffn_mult", 4) * d
-    device = sd["model.output_scale"].device
+    width = cfg["intermediate_size"]
+    device = sd["lm_head.output_scale"].device
 
     ids_t = torch.tensor(ids, device=device)
     angles = sd["model.embedding.phase_angles"][ids_t]
@@ -99,7 +99,7 @@ def logits(sd: dict[str, torch.Tensor], cfg: dict, ids: list[int]) -> torch.Tens
     pairs = x.view(len(ids), d // 2, 2)
     x = _rotate(pairs[..., 0], pairs[..., 1], torch.cos(pos_angles), torch.sin(pos_angles), x.shape)
 
-    for i in range(cfg["n_blocks"]):
+    for i in range(cfg["num_hidden_layers"]):
         p = f"model.blocks.{i}."
         a = p + "attention."
         h = _norm(x, sd[p + "norm1.scale"]).view(len(ids), heads, head_dim)
@@ -113,12 +113,12 @@ def logits(sd: dict[str, torch.Tensor], cfg: dict, ids: list[int]) -> torch.Tens
         x = x + _gate(sd, p + "res_gate_attn", mode) * o.reshape(len(ids), d)
         if p + "mixer.angles" in sd:
             x = x + _gate(sd, p + "res_gate_mixer", mode) * _mixer(_norm(x, sd[p + "norm_mixer.scale"]), sd, p + "mixer.")
-        f = F.pad(_norm(x, sd[p + "norm_ffn.scale"]), (0, d_ff - d))
+        f = F.pad(_norm(x, sd[p + "norm_ffn.scale"]), (0, width - d))
         fp, fi = sd.get(p + "ffn._ffn_perms"), sd.get(p + "ffn._ffn_inv_perms")
         f = _plain(f, sd[p + "ffn.expand_angles"], sd[p + "ffn.expand_scales"], fp, fi)
         fpairs = f.view(len(ids), -1, 2)
         radius = torch.norm(fpairs, dim=-1, keepdim=True)
-        f = (fpairs * (F.gelu(radius) / (radius + 1e-8))).view(len(ids), d_ff)
+        f = (fpairs * (F.gelu(radius) / (radius + 1e-8))).view(len(ids), width)
         f = _plain(f, sd[p + "ffn.contract_angles"], sd[p + "ffn.contract_scales"], fp, fi)
         x = x + _gate(sd, p + "res_gate_ffn", mode) * f[:, :d]
 
@@ -128,4 +128,4 @@ def logits(sd: dict[str, torch.Tensor], cfg: dict, ids: list[int]) -> torch.Tens
     table = table * torch.exp(sd["model.embedding.log_magnitude"].clamp(-5.0, 5.0)).unsqueeze(-1)
     x = x / (x.norm(dim=-1, keepdim=True) + 1e-6)
     table = table / (table.norm(dim=-1, keepdim=True) + 1e-6)
-    return (x @ table.T) * F.softplus(sd["model.output_scale"])
+    return (x @ table.T) * F.softplus(sd["lm_head.output_scale"])

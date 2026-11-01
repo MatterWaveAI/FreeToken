@@ -6,9 +6,6 @@ import safetensors
 import torch
 from freetoken.models.loader import iter_weight_files
 
-# Only a fused training kernel reads it; the reference forward ignores it.
-_UNUSED = (".decay_raw",)
-
 
 def iter_weights(
     model_path: str,
@@ -22,8 +19,6 @@ def iter_weights(
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for name in f.keys():
-                if name.endswith(_UNUSED):
-                    continue
                 # the butterfly permutations are stored as private buffers (`_attn_perms`); the
                 # model keeps them as state, which drops names with a leading underscore
                 prefix, _, leaf = name.rpartition(".")

@@ -10,7 +10,6 @@ _GATE_MODES = ("free", "bounded", "bounded_depth", "none")
 
 @dataclass(frozen=True)
 class GRTArgs:
-    d_ff: int
     n_qkv_rotations: int
     ffn_n_rotations: int
     n_mixer_rotations: int
@@ -20,17 +19,13 @@ class GRTArgs:
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
-    d_model = hf_config.d_model
-    n_heads = hf_config.n_heads
-    if d_model % 2 or d_model % n_heads or (d_model // n_heads) % 2:
-        raise ValueError(f"GRT needs an even d_model and head_dim; got d_model={d_model}, n_heads={n_heads}")
+    hidden_size = hf_config.hidden_size
+    n_heads = hf_config.num_attention_heads
+    if hidden_size % 2 or hidden_size % n_heads or (hidden_size // n_heads) % 2:
+        raise ValueError(
+            f"GRT needs an even hidden_size and head_dim; got hidden_size={hidden_size}, num_attention_heads={n_heads}"
+        )
 
-    # every released checkpoint, and the original implementation, uses the 4 Clifford features
-    if getattr(hf_config, "coupling_features", "clifford") != "clifford":
-        raise ValueError("GRT supports only coupling_features='clifford'")
-    # Later passes re-run the stack over positions whose earlier-pass keys a paged cache never holds.
-    if getattr(hf_config, "ouroboros_passes", 1) != 1:
-        raise ValueError("GRT with ouroboros_passes != 1 cannot be served from a KV cache")
     gate_mode = getattr(hf_config, "residual_gate_mode", "bounded_depth")
     if not getattr(hf_config, "learnable_residual_gates", True):
         gate_mode = "none"
@@ -40,11 +35,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if residual_norm not in ("none", "pearlnorm"):
         raise ValueError(f"Unknown GRT residual_norm_mode {residual_norm!r}")
 
-    d_ff = getattr(hf_config, "d_ff", None) or getattr(hf_config, "ffn_mult", 4) * d_model
-    head_dim = d_model // n_heads
-    max_seq_len = getattr(hf_config, "max_seq_len", 1024)
+    head_dim = hidden_size // n_heads
+    max_position = getattr(hf_config, "max_position_embeddings", 2048)
     args = GRTArgs(
-        d_ff=d_ff,
         n_qkv_rotations=getattr(hf_config, "n_qkv_rotations", 11),
         ffn_n_rotations=getattr(hf_config, "ffn_n_rotations", 21),
         n_mixer_rotations=getattr(hf_config, "n_mixer_rotations", 1),
@@ -53,18 +46,18 @@ def parse_config(hf_config: Any) -> ModelConfig:
         residual_pearlnorm=residual_norm == "pearlnorm",
     )
     return ModelConfig(
-        num_layers=hf_config.n_blocks,
+        num_layers=hf_config.num_hidden_layers,
         num_qo_heads=n_heads,
         num_kv_heads=n_heads,
         head_dim=head_dim,
-        hidden_size=d_model,
+        hidden_size=hidden_size,
         vocab_size=hf_config.vocab_size,
-        intermediate_size=d_ff,
+        intermediate_size=getattr(hf_config, "intermediate_size", None) or 4 * hidden_size,
         rms_norm_eps=1e-8,
         # position is one rotation of the whole stream at the input, not a per-head rope;
         # base 0 keeps the attention layers from building a rope table
         rotary_config=RotaryConfig(
-            head_dim=head_dim, rotary_dim=head_dim, max_position=max_seq_len, base=0.0, scaling=None
+            head_dim=head_dim, rotary_dim=head_dim, max_position=max_position, base=0.0, scaling=None
         ),
         hidden_act="gelu",
         # the cosine head reads the input embedding, so --embed-weights host must refuse it

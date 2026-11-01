@@ -109,8 +109,8 @@ class GRTPearlNorm(BaseOP):
 
 
 class GRTEmbedding(BaseOP):
-    def __init__(self, vocab_size: int, d_model: int):
-        self.phase_angles = _param(vocab_size, d_model // 2)
+    def __init__(self, vocab_size: int, hidden_size: int):
+        self.phase_angles = _param(vocab_size, hidden_size // 2)
         self.log_magnitude = _param(vocab_size)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
@@ -123,8 +123,8 @@ class GRTEmbedding(BaseOP):
 class GRTPositionalRotation(BaseOP):
     """Rotates each pair of the whole stream by ``position * exp(log_freqs)``, once, at the input."""
 
-    def __init__(self, d_model: int):
-        self.log_freqs = _param(d_model // 2)
+    def __init__(self, hidden_size: int):
+        self.log_freqs = _param(hidden_size // 2)
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # fp32 angles: a bf16 position is not exact above 256
@@ -211,19 +211,20 @@ class GRTMixer(BaseOP):
 
 
 class GRTFeedForward(BaseOP):
-    """Zero-pad to d_ff, rotate, radial GELU on pair magnitudes, rotate, truncate back to d_model."""
+    """Zero-pad to intermediate_size, rotate, radial GELU on pair magnitudes, rotate, truncate back to
+    hidden_size."""
 
     def __init__(self, config: ModelConfig):
         args: GRTArgs = config.grt_args
-        k, d_ff = args.ffn_n_rotations, args.d_ff
-        self._d_model = config.hidden_size
-        self._d_ff = d_ff
-        self.expand_angles = _param(k, d_ff // 2)
-        self.expand_scales = _param(k, d_ff)
-        self.contract_angles = _param(k, d_ff // 2)
-        self.contract_scales = _param(k, d_ff)
-        self.ffn_perms = _perms(k, d_ff) if k > 1 else None
-        self.ffn_inv_perms = _perms(k, d_ff) if k > 1 else None
+        k, width = args.ffn_n_rotations, config.intermediate_size
+        self._hidden_size = config.hidden_size
+        self._width = width
+        self.expand_angles = _param(k, width // 2)
+        self.expand_scales = _param(k, width)
+        self.contract_angles = _param(k, width // 2)
+        self.contract_scales = _param(k, width)
+        self.ffn_perms = _perms(k, width) if k > 1 else None
+        self.ffn_inv_perms = _perms(k, width) if k > 1 else None
         self._expand: tuple[torch.Tensor, ...] | None = None
         self._contract: tuple[torch.Tensor, ...] | None = None
         self._gathers: torch.Tensor | None = None
@@ -234,12 +235,12 @@ class GRTFeedForward(BaseOP):
         self._gathers = _chain_gathers(self.ffn_perms, self.ffn_inv_perms)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = _plain_chain(F.pad(x, (0, self._d_ff - self._d_model)), *self._expand, self._gathers)
+        x = _plain_chain(F.pad(x, (0, self._width - self._hidden_size)), *self._expand, self._gathers)
         pairs = x.view(*x.shape[:-1], -1, 2)
         radius = pairs.norm(dim=-1, keepdim=True)
         x = (pairs * (F.gelu(radius) / (radius + 1e-8))).flatten(-2)
         x = _plain_chain(x, *self._contract, self._gathers)
-        return x[..., : self._d_model]
+        return x[..., : self._hidden_size]
 
 
 class GRTDecoderLayer(BaseOP):
@@ -306,7 +307,6 @@ class GRTModel(BaseOP):
         self.pos_encoding = GRTPositionalRotation(config.hidden_size)
         self.blocks = OPList([GRTDecoderLayer(config, i) for i in range(config.num_layers)])
         self.final_norm = GRTPearlNorm(config.hidden_size)
-        self.output_scale = _param()
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         x = self.pos_encoding.forward(self.embedding.forward(input_ids), positions)
@@ -315,35 +315,47 @@ class GRTModel(BaseOP):
         return self.final_norm.forward(x)
 
 
+class GRTCosineHead(BaseOP):
+    """Cosine against every token's embedding times one learned temperature. The table is the tied
+    input embedding; table and temperature are constants, so ``fold`` combines them once."""
+
+    def __init__(self):
+        self.output_scale = _param()
+        self._head: torch.Tensor | None = None
+
+    def fold(self, table: torch.Tensor) -> None:
+        table = table / (table.norm(dim=-1, keepdim=True) + 1e-6)
+        self._head = table * F.softplus(self.output_scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert self._head is not None, "prepare_for_runtime() was not run"
+        x = x / (x.norm(dim=-1, keepdim=True) + 1e-6)
+        return x @ self._head.T
+
+
 class GRTForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         if get_tp_info().size != 1:
             raise ValueError("GRT has no tensor-parallel layout; serve it with --tp-size 1")
         self.model = GRTModel(config)
+        self.lm_head = GRTCosineHead()
         self._vocab_size = config.vocab_size
-        self._head: torch.Tensor | None = None
         super().__init__()
 
     def prepare_for_runtime(self) -> None:
         for block in self.model.blocks.op_list:
             block.prepare_for_runtime()
-        # The head is a cosine against every token's embedding times one learned temperature;
-        # the normalised table and the temperature are constants, so fold them once.
-        ids = torch.arange(self._vocab_size, device=self.model.output_scale.device)
-        table = self.model.embedding.forward(ids)
-        table = table / (table.norm(dim=-1, keepdim=True) + 1e-6)
-        self._head = table * F.softplus(self.model.output_scale)
+        ids = torch.arange(self._vocab_size, device=self.lm_head.output_scale.device)
+        self.lm_head.fold(self.model.embedding.forward(ids))
 
     @nvtx_annotate("LMHead")
     def _logits(self, x: torch.Tensor) -> torch.Tensor:
         batch = get_global_ctx().batch
         if batch.is_prefill:
             x = x[batch.attn_metadata.get_last_indices(batch.size)]
-        x = x / (x.norm(dim=-1, keepdim=True) + 1e-6)
-        return x @ self._head.T
+        return self.lm_head.forward(x)
 
     def forward(self) -> torch.Tensor:
-        assert self._head is not None, "prepare_for_runtime() was not run"
         batch = get_global_ctx().batch
         return self._logits(self.model.forward(batch.input_ids, batch.positions))
 

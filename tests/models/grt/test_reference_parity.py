@@ -124,7 +124,7 @@ def test_batched_greedy_decode_matches_reference(tiny, monkeypatch):
 def test_released_checkpoint_greedy_matches_reference(monkeypatch):
     path = os.environ.get("FREETOKEN_GRT_MODEL")
     if not path:
-        pytest.skip("set FREETOKEN_GRT_MODEL to a local GRT checkpoint (e.g. matterwaveai/grt-20m)")
+        pytest.skip("set FREETOKEN_GRT_MODEL to a local GRT checkpoint (e.g. matterwaveai/grt-30m)")
     from freetoken.models.loader import iter_weight_files
     from safetensors.torch import load_file
 
