@@ -353,6 +353,9 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # GRT (grt) payload (GRTArgs): rotation-chain depths, coupling feature count and the
+    # residual gate / norm modes. Opaque to model-agnostic engine code; None for every other model.
+    grt_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

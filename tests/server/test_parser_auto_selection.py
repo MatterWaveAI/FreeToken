@@ -30,6 +30,7 @@ ANON_PATH = "/models/anon"
 # Families with no thinking format of their own. Everything else must resolve to a real reasoning
 # parser, and a new architecture landing here is the bug this file exists to catch.
 NO_REASONING_FORMAT = {
+    "GRTForCausalLM",
     "LlamaForCausalLM",
     "LlamaGGUFForCausalLM",
     "MistralForCausalLM",
@@ -40,7 +41,7 @@ NO_REASONING_FORMAT = {
 
 # `llama3` is the end of the cascade -- the answer when nothing matched.
 GENERIC_TOOL_CALL_FALLBACK = "llama3"
-NO_DEDICATED_TOOL_FORMAT = {"LlamaForCausalLM", "LlamaGGUFForCausalLM"}
+NO_DEDICATED_TOOL_FORMAT = {"GRTForCausalLM", "LlamaForCausalLM", "LlamaGGUFForCausalLM"}
 
 
 class _Config:

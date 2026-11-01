@@ -21,6 +21,7 @@ for them; other checkpoints of the same architectures work too.
 | MiniMax-M3 | [nvidia/MiniMax-M3-NVFP4](https://huggingface.co/nvidia/MiniMax-M3-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
 | Flint | [FutureMLS-Lab/flint-nvfp4-coldgptq](https://huggingface.co/FutureMLS-Lab/flint-nvfp4-coldgptq), [RecursiveSI/flint-nvfp4-gguf](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf) |
+| GRT | [matterwaveai/grt-20m](https://huggingface.co/matterwaveai/grt-20m) |
 
 ### Image input
 
@@ -160,3 +161,7 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- GRT computes in fp32, as its checkpoints are stored; only the KV cache takes `--dtype`. Rounding
+  q/k/v to bf16 changes about 5% of greedy tokens on grt-20m (fp16: about 1%), so serve it with
+  `--dtype float32 --attention-backend triton`. It is a base model with no chat template: use
+  `/v1/completions`, on one GPU.

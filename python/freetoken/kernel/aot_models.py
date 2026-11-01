@@ -422,6 +422,13 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=5120,
         kv_groups=((8, 128),),
     ),
+    AotModel(
+        name="matterwaveai/grt-20m",
+        architecture="GRTForCausalLM",
+        hidden_size=256,
+        kv_groups=((4, 64),),
+        embed_indexing=False,  # phase-angle embedding, computed in torch
+    ),
 )
 
 

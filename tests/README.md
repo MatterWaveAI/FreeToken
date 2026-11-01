@@ -75,6 +75,7 @@ checkpoint is set:
 | `FREETOKEN_TEST_MODELS_ROOT` | `models/test_quant_config.py` — directory whose checkpoints the stored-tensor scheme scan checks (default `/mnt/nvme/models`) |
 | `FREETOKEN_DSV4_VL_MODEL` | `tokenizer/test_mm_tokenize.py` - local DeepSeek-V4 vision checkpoint |
 | `FREETOKEN_DSV4_VISION_CKPT` | `models/test_dsv4_vision.py` - the same checkpoint, for the parity tests against its `inference/` reference code |
+| `FREETOKEN_GRT_MODEL` | `models/grt/test_reference_parity.py` - local GRT checkpoint (e.g. `matterwaveai/grt-20m`); greedy decode against the cache-free reference |
 
 `test_aime.py` takes its sampling protocol from the checkpoint's own
 `generation_config.json` (pass@N at the recommended temperature, or a single greedy

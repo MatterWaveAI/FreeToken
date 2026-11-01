@@ -506,6 +506,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # dynamic quants (unsloth UD); the reader dequantizes and fuses them into the dense module
         unquantized_modules=("*.self_attn.kv_b_proj",),
     ),
+    "GRTForCausalLM": ModelSpec("freetoken.models.grt", "GRTForCausalLM"),
 }
 
 
