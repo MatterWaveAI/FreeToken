@@ -1,5 +1,13 @@
-from .config import parse_config
-from .model import GRTForCausalLM
-from .weight import iter_weights
+from .config import GRTArgs, parse_config
+from .model import GRTForCausalLM, quantize_model_weights
+from .weight import dequantize_symmetric, iter_weights, quantize_symmetric
 
-__all__ = ["GRTForCausalLM", "parse_config", "iter_weights"]
+__all__ = [
+    "GRTArgs",
+    "GRTForCausalLM",
+    "parse_config",
+    "iter_weights",
+    "quantize_model_weights",
+    "quantize_symmetric",
+    "dequantize_symmetric",
+]

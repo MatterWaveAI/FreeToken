@@ -18,6 +18,8 @@ from freetoken.layers import BaseOP, OPList
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
+from .weight import dequantize_symmetric, quantize_symmetric
+
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
@@ -67,6 +69,8 @@ def _coupled_chain(
     gathers: torch.Tensor | None,
     feature_eps: float,
     mixer_bivector: bool = False,
+    coupling_scale: torch.Tensor | None = None,
+    coupling_bits: int | None = None,
 ) -> torch.Tensor:
     """``x`` is ``[T, H, D]``; gathers permute D, the pair math runs on ``groups`` groups of ``H*D/groups``.
 
@@ -80,7 +84,12 @@ def _coupled_chain(
         x0, x1 = g[..., 0::2], g[..., 1::2]
         features = _clifford_features(x0, x1, mixer_bivector)
         features = features / (features.norm(dim=-1, keepdim=True) + feature_eps)
-        theta = angles[k] + torch.tanh(torch.einsum("tgj,gji->tgi", features, coupling[k]))
+        ck = (
+            dequantize_symmetric(coupling[k], coupling_scale[k], bits=coupling_bits, dim=-2)
+            if coupling_scale is not None and coupling_bits is not None
+            else coupling[k]
+        )
+        theta = angles[k] + torch.tanh(torch.einsum("tgj,gji->tgi", features, ck))
         x = (_rotate_pairs(g, torch.cos(theta), torch.sin(theta)) * scales[k]).view(t, h, d)
     if gathers is not None:
         x = x[..., gathers[-1]]
@@ -112,8 +121,45 @@ class GRTEmbedding(BaseOP):
     def __init__(self, vocab_size: int, hidden_size: int):
         self.phase_angles = _param(vocab_size, hidden_size // 2)
         self.log_magnitude = _param(vocab_size)
+        self._table_q: torch.Tensor | None = None
+        self._table_scale: torch.Tensor | None = None
+        self._quant_bits: int | None = None
+
+    def table(self) -> torch.Tensor:
+        if (
+            self._table_q is not None
+            and self._table_scale is not None
+            and self._quant_bits is not None
+        ):
+            return dequantize_symmetric(
+                self._table_q, self._table_scale, bits=self._quant_bits, dim=-1
+            )
+        pairs = torch.stack(
+            [torch.cos(self.phase_angles), torch.sin(self.phase_angles)], dim=-1
+        ).flatten(-2)
+        magnitude = self.log_magnitude.unsqueeze(-1).clamp(-5.0, 5.0).exp()
+        return pairs * magnitude
+
+    def quantize_weights(self, bits: int = 8) -> None:
+        full_table = self.table()
+        qweight, scale = quantize_symmetric(full_table, bits=bits, dim=-1)
+        self._table_q = qweight
+        self._table_scale = scale
+        self._quant_bits = bits
+        self.phase_angles = torch.empty(0, dtype=_F32, device=qweight.device)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        if (
+            self._table_q is not None
+            and self._table_scale is not None
+            and self._quant_bits is not None
+        ):
+            return dequantize_symmetric(
+                self._table_q[ids],
+                self._table_scale[ids],
+                bits=self._quant_bits,
+                dim=-1,
+            )
         angles = F.embedding(ids, self.phase_angles)
         pairs = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1).flatten(-2)
         magnitude = F.embedding(ids, self.log_magnitude.unsqueeze(-1)).clamp(-5.0, 5.0).exp()
@@ -147,9 +193,10 @@ class GRTAttention(BaseOP):
         # a single-stage chain has no butterfly and the checkpoint stores no permutations for it
         self.attn_perms = _perms(k, self._head_dim) if k > 1 else None
         self.attn_inv_perms = _perms(k, self._head_dim) if k > 1 else None
-        self._qkv: tuple[torch.Tensor, ...] | None = None
-        self._o: tuple[torch.Tensor, ...] | None = None
+        self._qkv: tuple[torch.Tensor | int | None, ...] | None = None
+        self._o: tuple[torch.Tensor | int | None, ...] | None = None
         self._gathers: torch.Tensor | None = None
+        self._quant_bits: int | None = None
 
     def prepare_for_runtime(self) -> None:
         # q, k and v read the same input and share the permutations, so they run as one chain of 3*H heads
@@ -157,13 +204,42 @@ class GRTAttention(BaseOP):
             torch.cat([self.q_angles, self.k_angles, self.v_angles], dim=1),
             torch.cat([self.q_coupling, self.k_coupling, self.v_coupling], dim=1),
             F.softplus(torch.cat([self.q_scales, self.k_scales, self.v_scales], dim=1)),
+            None,
+            None,
         )
-        self._o = (self.o_angles, self.o_coupling, F.softplus(self.o_scales))
+        self._o = (self.o_angles, self.o_coupling, F.softplus(self.o_scales), None, None)
         self._gathers = _chain_gathers(self.attn_perms, self.attn_inv_perms)
+        self._quant_bits = None
 
-    def _chain(self, x: torch.Tensor, params: tuple[torch.Tensor, ...]) -> torch.Tensor:
-        angles, coupling, scales = params
-        return _coupled_chain(x, x.shape[1], angles, coupling, scales, self._gathers, 1e-6)
+    def quantize_weights(self, bits: int = 8) -> None:
+        assert self._qkv is not None and self._o is not None, "prepare_for_runtime() was not run"
+        qkv_angles, qkv_c, qkv_scales, qkv_s, qkv_b = self._qkv
+        o_angles, o_c, o_scales, o_s, o_b = self._o
+        if qkv_s is not None and qkv_b is not None:
+            qkv_c = dequantize_symmetric(qkv_c, qkv_s, bits=qkv_b, dim=-2)
+        if o_s is not None and o_b is not None:
+            o_c = dequantize_symmetric(o_c, o_s, bits=o_b, dim=-2)
+        qkv_cq, qkv_cs = quantize_symmetric(qkv_c, bits=bits, dim=-2)
+        o_cq, o_cs = quantize_symmetric(o_c, bits=bits, dim=-2)
+        self._qkv = (qkv_angles, qkv_cq, qkv_scales, qkv_cs, bits)
+        self._o = (o_angles, o_cq, o_scales, o_cs, bits)
+        self._quant_bits = bits
+        for name in ("q", "k", "v", "o"):
+            setattr(self, f"{name}_coupling", torch.empty(0, dtype=_F32, device=qkv_cq.device))
+
+    def _chain(self, x: torch.Tensor, params: tuple[torch.Tensor | int | None, ...]) -> torch.Tensor:
+        angles, coupling, scales, coupling_scale, coupling_bits = params
+        return _coupled_chain(
+            x,
+            x.shape[1],
+            angles,
+            coupling,
+            scales,
+            self._gathers,
+            1e-6,
+            coupling_scale=coupling_scale,
+            coupling_bits=coupling_bits,
+        )
 
     @nvtx_annotate("MHA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -191,8 +267,9 @@ class GRTMixer(BaseOP):
         self.coupling = _param(k, self._n_groups, 4 * self._group, self._group)
         self.perms_stack = _perms(k, d)
         self.inv_perms_stack = _perms(k, d)
-        self._params: tuple[torch.Tensor, ...] | None = None
+        self._params: tuple[torch.Tensor | int | None, ...] | None = None
         self._gathers: torch.Tensor | None = None
+        self._quant_bits: int | None = None
 
     def prepare_for_runtime(self) -> None:
         k = self.angles.shape[0]
@@ -200,13 +277,37 @@ class GRTMixer(BaseOP):
             self.angles.view(k, self._n_groups, self._group),
             self.coupling,
             F.softplus(self.scales).view(k, self._n_groups, 2 * self._group),
+            None,
+            None,
         )
         self._gathers = _chain_gathers(self.perms_stack, self.inv_perms_stack)
+        self._quant_bits = None
+
+    def quantize_weights(self, bits: int = 8) -> None:
+        assert self._params is not None, "prepare_for_runtime() was not run"
+        angles, coupling, scales, c_scale, c_bits = self._params
+        if c_scale is not None and c_bits is not None:
+            coupling = dequantize_symmetric(coupling, c_scale, bits=c_bits, dim=-2)
+        cq, cs = quantize_symmetric(coupling, bits=bits, dim=-2)
+        self._params = (angles, cq, scales, cs, bits)
+        self.coupling = cq
+        self._quant_bits = bits
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        angles, coupling, scales = self._params
+        angles, coupling, scales, c_scale, c_bits = self._params
         t, d = x.shape
-        y = _coupled_chain(x.view(t, 1, d), self._n_groups, angles, coupling, scales, self._gathers, 1e-2, mixer_bivector=True)
+        y = _coupled_chain(
+            x.view(t, 1, d),
+            self._n_groups,
+            angles,
+            coupling,
+            scales,
+            self._gathers,
+            1e-2,
+            mixer_bivector=True,
+            coupling_scale=c_scale,
+            coupling_bits=c_bits,
+        )
         return y.view(t, d)
 
 
@@ -283,6 +384,11 @@ class GRTDecoderLayer(BaseOP):
             self.mixer.prepare_for_runtime()
         self.ffn.prepare_for_runtime()
 
+    def quantize_weights(self, bits: int = 8) -> None:
+        self.attention.quantize_weights(bits)
+        if self.mixer is not None:
+            self.mixer.quantize_weights(bits)
+
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_attn, gate_mixer, gate_ffn = self._gates
@@ -308,6 +414,11 @@ class GRTModel(BaseOP):
         self.blocks = OPList([GRTDecoderLayer(config, i) for i in range(config.num_layers)])
         self.final_norm = GRTPearlNorm(config.hidden_size)
 
+    def quantize_weights(self, bits: int = 8) -> None:
+        self.embedding.quantize_weights(bits)
+        for block in self.blocks.op_list:
+            block.quantize_weights(bits)
+
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         x = self.pos_encoding.forward(self.embedding.forward(input_ids), positions)
         for block in self.blocks.op_list:
@@ -322,15 +433,46 @@ class GRTCosineHead(BaseOP):
     def __init__(self):
         self.output_scale = _param()
         self._head: torch.Tensor | None = None
+        self._head_scale: torch.Tensor | None = None
+        self._quant_bits: int | None = None
 
     def fold(self, table: torch.Tensor) -> None:
         table = table / (table.norm(dim=-1, keepdim=True) + 1e-6)
         self._head = table * F.softplus(self.output_scale)
+        self._head_scale = None
+        self._quant_bits = None
+
+    def quantize_weights(self, bits: int = 8, table: torch.Tensor | None = None) -> None:
+        if table is not None:
+            unit_table = table / (table.norm(dim=-1, keepdim=True) + 1e-6)
+            full_head = unit_table * F.softplus(self.output_scale)
+        elif (
+            self._head is not None
+            and self._head_scale is not None
+            and self._quant_bits is not None
+        ):
+            full_head = dequantize_symmetric(
+                self._head, self._head_scale, bits=self._quant_bits, dim=-1
+            )
+        else:
+            assert self._head is not None, "prepare_for_runtime() was not run"
+            full_head = self._head
+        hq, hs = quantize_symmetric(full_head, bits=bits, dim=-1)
+        self._head = hq
+        self._head_scale = hs
+        self._quant_bits = bits
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert self._head is not None, "prepare_for_runtime() was not run"
         x = x / (x.norm(dim=-1, keepdim=True) + 1e-6)
-        return x @ self._head.T
+        head = (
+            dequantize_symmetric(
+                self._head, self._head_scale, bits=self._quant_bits, dim=-1
+            )
+            if self._head_scale is not None and self._quant_bits is not None
+            else self._head
+        )
+        return x @ head.T
 
 
 class GRTForCausalLM(BaseLLMModel):
@@ -340,13 +482,23 @@ class GRTForCausalLM(BaseLLMModel):
         self.model = GRTModel(config)
         self.lm_head = GRTCosineHead()
         self._vocab_size = config.vocab_size
+        self._quantize_bits = getattr(config.grt_args, "quantize_bits", None)
         super().__init__()
 
     def prepare_for_runtime(self) -> None:
         for block in self.model.blocks.op_list:
             block.prepare_for_runtime()
-        ids = torch.arange(self._vocab_size, device=self.lm_head.output_scale.device)
-        self.lm_head.fold(self.model.embedding.forward(ids))
+        if self._quantize_bits is not None:
+            self.quantize_weights(self._quantize_bits)
+        else:
+            ids = torch.arange(self._vocab_size, device=self.lm_head.output_scale.device)
+            self.lm_head.fold(self.model.embedding.forward(ids))
+
+    @torch.no_grad()
+    def quantize_weights(self, bits: int = 8) -> None:
+        table = self.model.embedding.table()
+        self.model.quantize_weights(bits)
+        self.lm_head.quantize_weights(bits, table=table)
 
     @nvtx_annotate("LMHead")
     def _logits(self, x: torch.Tensor) -> torch.Tensor:
@@ -360,4 +512,10 @@ class GRTForCausalLM(BaseLLMModel):
         return self._logits(self.model.forward(batch.input_ids, batch.positions))
 
 
-__all__ = ["GRTForCausalLM"]
+def quantize_model_weights(model: GRTForCausalLM, bits: int = 8) -> GRTForCausalLM:
+    """Quantize a runtime-prepared `GRTForCausalLM` in-place to `bits`-bit (`8` or `4`)."""
+    model.quantize_weights(bits=bits)
+    return model
+
+
+__all__ = ["GRTForCausalLM", "quantize_model_weights"]

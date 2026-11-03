@@ -16,6 +16,23 @@ class GRTArgs:
     gate_mode: str
     peri_ln: bool
     residual_pearlnorm: bool
+    quantize_bits: int | None = None
+
+
+def _resolve_quantize_bits(hf_config: Any) -> int | None:
+    bits = getattr(hf_config, "quantize_bits", None)
+    if bits in (4, 8):
+        return int(bits)
+    qcfg = getattr(hf_config, "quantization_config", None)
+    if isinstance(qcfg, dict):
+        b = qcfg.get("bits") or qcfg.get("num_bits")
+        if b in (4, 8):
+            return int(b)
+        if qcfg.get("load_in_4bit"):
+            return 4
+        if qcfg.get("load_in_8bit"):
+            return 8
+    return None
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -44,6 +61,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         gate_mode=gate_mode,
         peri_ln=bool(getattr(hf_config, "peri_ln", False)),
         residual_pearlnorm=residual_norm == "pearlnorm",
+        quantize_bits=_resolve_quantize_bits(hf_config),
     )
     return ModelConfig(
         num_layers=hf_config.num_hidden_layers,

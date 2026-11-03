@@ -17,14 +17,14 @@ from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.engine.engine import _materialize_loaded_weight_state_dict
 from freetoken.layers.quantization import NoQuantConfig
 from freetoken.models import create_model
-from freetoken.models.grt import iter_weights, parse_config
+from freetoken.models.grt import iter_weights, parse_config, quantize_model_weights
 from freetoken.utils.hf import cached_load_hf_config
 from freetoken.utils.torch_utils import torch_dtype
 
 from . import reference
 from .common import write_tiny_checkpoint
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+CUDA_ONLY = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 WIDTH = 512
 ATOL = RTOL = 1e-3
@@ -81,9 +81,11 @@ def tiny(tmp_path_factory):
     state = write_tiny_checkpoint(path)
     with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
-    return path, {k: v.cuda() for k, v in state.items()}, cfg
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    return path, {k: v.to(dev) for k, v in state.items()}, cfg
 
 
+@CUDA_ONLY
 def test_ragged_prefill_matches_reference(tiny, monkeypatch):
     path, state, cfg = tiny
     engine = TinyGRT(path, monkeypatch)
@@ -93,6 +95,7 @@ def test_ragged_prefill_matches_reference(tiny, monkeypatch):
     torch.testing.assert_close(got, want, atol=ATOL, rtol=RTOL)
 
 
+@CUDA_ONLY
 def test_chunked_prefill_matches_reference(tiny, monkeypatch):
     """The second chunk's rows sit at positions 130.. and attend to the first chunk through the pool."""
     path, state, cfg = tiny
@@ -103,6 +106,7 @@ def test_chunked_prefill_matches_reference(tiny, monkeypatch):
     torch.testing.assert_close(got[0], reference.logits(state, cfg, prompt)[-1], atol=ATOL, rtol=RTOL)
 
 
+@CUDA_ONLY
 def test_batched_greedy_decode_matches_reference(tiny, monkeypatch):
     path, state, cfg = tiny
     engine = TinyGRT(path, monkeypatch)
@@ -120,6 +124,63 @@ def test_batched_greedy_decode_matches_reference(tiny, monkeypatch):
         logits = engine.forward(reqs, "decode")
 
 
+class _SDPATestBackend:
+    def forward(self, q, k, v, layer_id, batch):
+        t, h, d = q.shape
+        qh = q.transpose(0, 1).unsqueeze(0)
+        kh = k.view(t, h, d).transpose(0, 1).unsqueeze(0)
+        vh = v.view(t, h, d).transpose(0, 1).unsqueeze(0)
+        out = torch.nn.functional.scaled_dot_product_attention(qh, kh, vh, is_causal=True)
+        return out.squeeze(0).transpose(0, 1).contiguous()
+
+
+@pytest.mark.parametrize("bits,atol", [(8, 0.15), (4, 0.65)])
+def test_weight_quantization_matches_fp32_reference(tiny, monkeypatch, bits: int, atol: float):
+    from contextlib import nullcontext
+
+    path, state, cfg = tiny
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    if not torch.cuda.is_available():
+        monkeypatch.setattr(torch.cuda.nvtx, "range", lambda *args, **kwargs: nullcontext())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config = replace(parse_config(cached_load_hf_config(path)), quant=NoQuantConfig())
+    ctx = Context(page_size=1)
+    ctx.attn_backend = _SDPATestBackend()
+    ctx._batch = object()
+    monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
+
+    with torch.device("meta"), torch_dtype(torch.float32):
+        model = create_model(config)
+    weights = iter_weights(path, device, include_moe_experts=False, include_non_moe=True)
+    model.load_state_dict(_materialize_loaded_weight_state_dict(model.state_dict(), weights, device=device))
+    model.prepare_for_runtime()
+    quantize_model_weights(model, bits=bits)
+
+    expected_dtype = torch.int8 if bits == 8 else torch.uint8
+    assert model.model.embedding._table_q.dtype == expected_dtype
+    assert model.lm_head._head.dtype == expected_dtype
+    for block in model.model.blocks.op_list:
+        assert block.attention._qkv[0].dtype == torch.float32  # angles
+        assert block.attention._qkv[1].dtype == expected_dtype  # coupling
+        assert block.attention._qkv[2].dtype == torch.float32  # scales
+        assert block.attention._o[0].dtype == torch.float32
+        assert block.attention._o[1].dtype == expected_dtype
+        assert block.attention._o[2].dtype == torch.float32
+        assert block.mixer.angles.dtype == torch.float32
+        assert block.mixer.scales.dtype == torch.float32
+        assert block.mixer.coupling.dtype == expected_dtype
+
+    (prompt,) = _prompts(cfg["vocab_size"], (12,), seed=5)
+    ids_t = torch.tensor(prompt, dtype=torch.long, device=device)
+    pos_t = torch.arange(len(prompt), dtype=torch.long, device=device)
+    with torch.no_grad():
+        got = model.lm_head.forward(model.model.forward(ids_t, pos_t))
+        want = reference.logits(state, cfg, prompt)
+    torch.testing.assert_close(got, want, atol=atol, rtol=0.1)
+
+
+@CUDA_ONLY
 @pytest.mark.needs_weights
 def test_released_checkpoint_greedy_matches_reference(monkeypatch):
     path = os.environ.get("FREETOKEN_GRT_MODEL")
