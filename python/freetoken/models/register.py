@@ -507,6 +507,9 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         unquantized_modules=("*.self_attn.kv_b_proj",),
     ),
     "GRTForCausalLM": ModelSpec("freetoken.models.grt", "GRTForCausalLM"),
+    "GRTVLForConditionalGeneration": ModelSpec(
+        "freetoken.models.grt", "GRTVLForConditionalGeneration"
+    ),
 }
 
 

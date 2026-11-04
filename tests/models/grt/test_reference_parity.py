@@ -206,3 +206,98 @@ def test_released_checkpoint_greedy_matches_reference(monkeypatch):
         req.complete_one()
         req.append_host(want.argmax().reshape(1).to(torch.int32).cpu())
         logits = engine.forward([req], "decode")
+
+
+def test_grt_vl_forward_and_quantization(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    if not torch.cuda.is_available():
+        monkeypatch.setattr(torch.cuda.nvtx, "range", lambda *args, **kwargs: nullcontext())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    hf_vl_cfg = SimpleNamespace(
+        model_type="grt_vl",
+        architectures=["GRTVLForConditionalGeneration"],
+        image_token_id=250,
+        vision_config=SimpleNamespace(
+            image_size=28,
+            patch_size=7,
+            num_channels=3,
+            spatial_merge_size=2,
+            hidden_size=32,
+            intermediate_size=160,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            patch_n_rotations=3,
+            merger_n_rotations=3,
+            ffn_n_rotations=3,
+            n_qkv_rotations=2,
+            n_mixer_rotations=1,
+            residual_gate_mode="bounded_depth",
+            learnable_residual_gates=True,
+        ),
+        text_config=SimpleNamespace(
+            vocab_size=256,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            max_position_embeddings=512,
+            ffn_n_rotations=3,
+            n_qkv_rotations=2,
+            n_mixer_rotations=1,
+            residual_gate_mode="bounded_depth",
+            residual_norm_mode="none",
+            learnable_residual_gates=True,
+            peri_ln=False,
+        ),
+    )
+
+    config = replace(parse_config(hf_vl_cfg), quant=NoQuantConfig())
+    ctx = Context(page_size=1)
+    ctx.attn_backend = _SDPATestBackend()
+    ctx._batch = object()
+    monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
+
+    model = create_model(config)
+    g = torch.Generator().manual_seed(19)
+    state = {}
+    for k, v in model.state_dict().items():
+        if v.dtype == torch.long:
+            n_stages, dim = v.shape
+            n_levels = max(1, int(torch.tensor(dim // 2).float().log2().item()))
+            perms = []
+            for st in range(n_stages):
+                stride = 1 << (st % n_levels)
+                perms.append(
+                    [
+                        s + i + off
+                        for s in range(0, dim, 2 * stride)
+                        for i in range(stride)
+                        for off in (0, stride)
+                    ]
+                )
+            pt = torch.tensor(perms, dtype=torch.long)
+            state[k] = (pt.argsort(dim=-1) if "inv_perms" in k else pt).to(device)
+        elif "scale" in k or "norm" in k:
+            state[k] = (torch.randn(v.shape, generator=g) * 0.1 + 0.5).to(device)
+        else:
+            state[k] = (torch.randn(v.shape, generator=g) * 0.2).to(device)
+
+    model.load_state_dict(state)
+    model.prepare_for_runtime()
+
+    input_ids = torch.tensor([1, 248, 250, 250, 250, 250, 249, 10, 11], dtype=torch.long, device=device)
+    positions = torch.arange(len(input_ids), dtype=torch.long, device=device)
+    pixel_values = torch.randn(1, 3, 28, 28, device=device)
+
+    with torch.no_grad():
+        ref_logits = model.forward_multimodal(input_ids, positions, pixel_values=pixel_values)
+        assert ref_logits.shape == (9, 256)
+        quantize_model_weights(model, bits=8)
+        q_logits = model.forward_multimodal(input_ids, positions, pixel_values=pixel_values)
+        torch.testing.assert_close(q_logits, ref_logits, atol=0.35, rtol=0.15)
+
